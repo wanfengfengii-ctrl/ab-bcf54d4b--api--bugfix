@@ -2,7 +2,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { solveDeduplication } from '../src/dedup.js';
+import { solveDeduplication, SolverLimitError, SOLVER_LIMITS } from '../src/dedup.js';
 
 /** 构造归一化输入（与校验后的结构一致）。 */
 function mk(tolerance, fields) {
@@ -199,4 +199,41 @@ test('复杂场景：多视野重叠带的整体最优', () => {
   assert.equal(r.linkCount, 3);
   assert.deepEqual(groupOf(r, 'C1'), ['A1', 'B1', 'C1']);
   assert.deepEqual(groupOf(r, 'A2'), ['A2', 'B2']);
+});
+
+/** 验收场景稠密草稿：F1、F2 各 20 个类别相同、坐标相同的观测，F3 一个孤立观测（41 观测、400 候选关联）。 */
+function denseDraft() {
+  const same = (prefix) => Array.from({ length: 20 }, (_, i) => ({ id: `${prefix}${i + 1}`, x: 10, y: 10, category: 'PE' }));
+  return mk(5, [
+    { particles: same('A') },
+    { particles: same('B') },
+    { offset: { x: 100000, y: 100000 }, particles: [{ id: 'C1', x: 0, y: 0, category: 'PP' }] },
+  ]);
+}
+
+test('满足静态规模上限但精确裁决不可承受的稠密草稿：快速抛出规模错误', () => {
+  const input = denseDraft();
+  // 前置确认：该草稿未触发任何静态规模上限
+  assert.ok(41 <= SOLVER_LIMITS.maxComponentNodes);
+  assert.ok(400 <= SOLVER_LIMITS.maxComponentEdges);
+  const t0 = Date.now();
+  assert.throws(() => solveDeduplication(input), (err) => {
+    assert.ok(err instanceof SolverLimitError);
+    assert.match(err.message, /搜索量超出求解上限/);
+    return true;
+  });
+  // 受控失败必须足够快，避免阻塞服务（实际约数百毫秒，留足慢速机器余量）
+  assert.ok(Date.now() - t0 < 5000, `稠密草稿应在 5 秒内被拒绝，实际 ${Date.now() - t0}ms`);
+});
+
+test('搜索步数预算可用 options 调小：小规模输入同样受控失败', () => {
+  const input = mk(0, [
+    { particles: [{ id: 'P1', x: 0, y: 0, category: 'PE' }] },
+    { particles: [{ id: 'P2', x: 0, y: 0, category: 'PE' }] },
+    { particles: [{ id: 'P3', x: 0, y: 0, category: 'PE' }] },
+  ]);
+  // 默认预算下可精确裁决
+  assert.equal(solveDeduplication(input).totalParticles, 1);
+  // 预算为 0 时立即受控失败
+  assert.throws(() => solveDeduplication(input, { maxSearchSteps: 0 }), SolverLimitError);
 });

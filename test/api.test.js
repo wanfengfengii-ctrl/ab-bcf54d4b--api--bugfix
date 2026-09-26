@@ -90,3 +90,50 @@ test('未知接口返回 404', async () => {
   const res = await fetch(`${base}/api/no-such-endpoint`);
   assert.equal(res.status, 404);
 });
+
+test('稠密草稿（满足静态规模上限）快速返回受控 422，服务保持可响应', async () => {
+  // 验收场景：F1、F2 各 20 个类别相同、坐标相同的观测，F3 一个孤立观测（41 观测、400 候选关联）
+  const same = (prefix) => Array.from({ length: 20 }, (_, i) => ({ id: `${prefix}${i + 1}`, x: 10, y: 10, category: 'PE' }));
+  const dense = {
+    tolerance: 5,
+    fields: [
+      { offset: { x: 0, y: 0 }, particles: same('A') },
+      { offset: { x: 0, y: 0 }, particles: same('B') },
+      { offset: { x: 100000, y: 100000 }, particles: [{ id: 'C1', x: 0, y: 0, category: 'PP' }] },
+    ],
+  };
+  const t0 = Date.now();
+  const res = await post(dense);
+  const elapsed = Date.now() - t0;
+  assert.equal(res.status, 422);
+  const body = await res.json();
+  assert.ok(body.error && typeof body.error.message === 'string');
+  assert.match(body.error.message, /超出求解上限/);
+  assert.ok(elapsed < 5000, `稠密草稿应在 5 秒内得到受控响应，实际 ${elapsed}ms`);
+
+  // 一次稠密请求之后服务立即恢复响应：健康检查与既有合法草稿均正常
+  const health = await fetch(`${base}/api/health`);
+  assert.equal(health.status, 200);
+  const ok = await post({
+    tolerance: 1,
+    fields: [
+      { offset: { x: 0, y: 0 }, particles: [{ id: 'A1', x: 0, y: 0, category: 'PE' }, { id: 'A2', x: 2, y: 0, category: 'PE' }] },
+      { offset: { x: 0, y: 0 }, particles: [{ id: 'B1', x: 1, y: 0, category: 'PE' }, { id: 'B2', x: 0, y: 1, category: 'PE' }] },
+      { offset: { x: 100, y: 100 }, particles: [{ id: 'C1', x: 0, y: 0, category: 'PP' }] },
+    ],
+  });
+  assert.equal(ok.status, 200);
+  assert.equal((await ok.json()).totalParticles, 3); // 既有去重语义不变
+
+  // 真正无效的输入仍返回既有业务错误反馈（400 + 可定位 issues）
+  const bad = await post({
+    tolerance: 1,
+    fields: [
+      { offset: { x: 0, y: 0 }, particles: [{ id: 'A1', x: 0, y: 0, category: 'PE' }] },
+      { offset: { x: 0, y: 0 }, particles: [{ id: 'A1', x: 0.5, y: 0, category: '' }] },
+    ],
+  });
+  assert.equal(bad.status, 400);
+  const badBody = await bad.json();
+  assert.ok(Array.isArray(badBody.error.issues) && badBody.error.issues.length > 0);
+});

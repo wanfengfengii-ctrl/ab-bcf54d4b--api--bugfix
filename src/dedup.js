@@ -21,7 +21,29 @@ export const SOLVER_LIMITS = Object.freeze({
   maxCandidateLinks: 100000, // 全部候选关联上限
   maxComponentNodes: 200,    // 单个候选连通分量的观测上限
   maxComponentEdges: 5000,   // 单个候选连通分量的候选关联上限
+  maxSearchSteps: 20000000,  // 单次裁决的精确搜索步数预算（超出按规模超限处理）
 });
+
+/**
+ * 单次裁决的搜索步数预算：以确定性计数限制精确求解（分支定界 + 字典序构造）
+ * 的工作量。候选图在静态规模上限之内仍可能因过于稠密而使精确搜索组合爆炸，
+ * 预算耗尽即抛 SolverLimitError，由 API 层映射为受控的 422 业务规模错误，
+ * 避免一次请求长时间阻塞服务。
+ */
+class SearchBudget {
+  constructor(limit) {
+    this.limit = limit;
+    this.remaining = limit;
+  }
+  charge(cost) {
+    this.remaining -= cost;
+    if (this.remaining < 0) {
+      throw new SolverLimitError(
+        `候选关联过于稠密，精确裁决所需搜索量超出求解上限（${this.limit} 步），请缩小容差或拆分批次`,
+      );
+    }
+  }
+}
 
 /** 编号比较：按字符串字典序（提交内编号唯一，不存在相等）。 */
 function compareId(a, b) {
@@ -92,9 +114,9 @@ class RollbackUnionFind {
 
 /**
  * 第一阶段：在候选边上求 (最多关联数, 该数量下的最小曼哈顿差总和)。
- * 迭代式分支定界；边已按 (w, a, b) 升序。
+ * 迭代式分支定界；边已按 (w, a, b) 升序。每个栈帧处理计 1 步搜索预算。
  */
-function bestForest(edges, uf) {
+function bestForest(edges, uf, budget) {
   const m = edges.length;
   const pref = new Float64Array(m + 1);
   for (let i = 0; i < m; i++) pref[i + 1] = pref[i] + edges[i].w;
@@ -113,6 +135,7 @@ function bestForest(edges, uf) {
   // 栈帧：{i, sel, w, phase, cp}；phase 0=待展开 1=已探索包含 2=两分支完成
   const stack = [{ i: 0, sel: 0, w: 0, phase: 0, cp: 0 }];
   while (stack.length > 0) {
+    budget.charge(1);
     const f = stack[stack.length - 1];
     if (f.phase === 0) {
       if (f.i === m) {
@@ -152,14 +175,16 @@ function bestForest(edges, uf) {
 }
 
 /** 在 avail（全局边下标，保持重量升序）中精确选出 needCount 条、总重恰为 needWeight 的可行森林是否存在。 */
-function dfsExact(edges, avail, uf, needCount, needWeight) {
+function dfsExact(edges, avail, uf, budget, needCount, needWeight) {
   const m = avail.length;
+  budget.charge(m + 1); // 前缀和构建与本次判定本身的开销
   const pref = new Float64Array(m + 1);
   for (let i = 0; i < m; i++) pref[i + 1] = pref[i] + edges[avail[i]].w;
 
   let found = false;
   const stack = [{ j: 0, picked: 0, w: 0, phase: 0, cp: 0 }];
   while (stack.length > 0 && !found) {
+    budget.charge(1);
     const f = stack[stack.length - 1];
     if (f.phase === 0) {
       const need = needCount - f.picked;
@@ -196,7 +221,8 @@ function dfsExact(edges, avail, uf, needCount, needWeight) {
 }
 
 /** 判定：在强制包含 inSet、强制排除 outSet 下，是否存在达到 (targetCount, targetWeight) 的可行森林。 */
-function existsOptimalForest(edges, uf, inSet, outSet, targetCount, targetWeight) {
+function existsOptimalForest(edges, uf, budget, inSet, outSet, targetCount, targetWeight) {
+  budget.charge(edges.length + 1); // 可用边收集与强制包含的合并开销
   const cp0 = uf.checkpoint();
   let inCount = 0;
   let inWeight = 0;
@@ -214,7 +240,7 @@ function existsOptimalForest(edges, uf, inSet, outSet, targetCount, targetWeight
   for (let i = 0; i < edges.length; i += 1) {
     if (!inSet.has(i) && !outSet.has(i)) avail.push(i);
   }
-  const found = dfsExact(edges, avail, uf, targetCount - inCount, targetWeight - inWeight);
+  const found = dfsExact(edges, avail, uf, budget, targetCount - inCount, targetWeight - inWeight);
   uf.rollback(cp0);
   return found;
 }
@@ -226,7 +252,7 @@ function existsOptimalForest(edges, uf, inSet, outSet, targetCount, targetWeight
  * 逐观测（全局顺序）确定其伙伴编号升序列表：能终止则终止（前缀更短更小），
  * 否则取可行的最小编号作为下一个伙伴；已确定的约束通过强制包含/排除传播。
  */
-function lexMinForest(observations, compUids, edges, uf, targetCount, targetWeight) {
+function lexMinForest(observations, compUids, edges, uf, budget, targetCount, targetWeight) {
   const adj = new Map(); // 局部下标 → [{idx, partnerId}]（按伙伴编号升序）
   for (let idx = 0; idx < edges.length; idx += 1) {
     const e = edges[idx];
@@ -239,7 +265,7 @@ function lexMinForest(observations, compUids, edges, uf, targetCount, targetWeig
 
   const inSet = new Set();
   const outSet = new Set();
-  const feasible = () => existsOptimalForest(edges, uf, inSet, outSet, targetCount, targetWeight);
+  const feasible = () => existsOptimalForest(edges, uf, budget, inSet, outSet, targetCount, targetWeight);
 
   for (let local = 0; local < compUids.length; local += 1) {
     const all = adj.get(local) || [];
@@ -302,10 +328,12 @@ const round2 = (v) => {
 /**
  * 求解去重裁决。
  * @param {{tolerance:number, fields:Array}} input 已通过校验并归一化的输入
+ * @param {{maxSearchSteps?:number}} [options] 可调求解规模（默认取 SOLVER_LIMITS）
  * @returns 裁决结果（最终颗粒、观测归属、代表坐标、类别、所选关联、总数）
  */
-export function solveDeduplication(input) {
+export function solveDeduplication(input, options = {}) {
   const { tolerance, fields } = input;
+  const budget = new SearchBudget(options.maxSearchSteps ?? SOLVER_LIMITS.maxSearchSteps);
 
   // 展开观测：全局顺序 = 视野录入顺序 → 视野内录入顺序
   const observations = [];
@@ -373,8 +401,8 @@ export function solveDeduplication(input) {
     }));
     localEdges.sort((x, y) => x.w - y.w || x.a - y.a || x.b - y.b);
     const uf = new RollbackUnionFind(comp.nodes.map((u) => observations[u].fieldIndex));
-    const { count, weight } = bestForest(localEdges, uf);
-    const inSet = lexMinForest(observations, comp.nodes, localEdges, uf, count, weight);
+    const { count, weight } = bestForest(localEdges, uf, budget);
+    const inSet = lexMinForest(observations, comp.nodes, localEdges, uf, budget, count, weight);
     for (const li of inSet) chosenGlobal.add(localEdges[li].g);
   }
 
