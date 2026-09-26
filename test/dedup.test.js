@@ -2,7 +2,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { solveDeduplication } from '../src/dedup.js';
+import { solveDeduplication, SolverLimitError } from '../src/dedup.js';
 
 /** 构造归一化输入（与校验后的结构一致）。 */
 function mk(tolerance, fields) {
@@ -199,4 +199,34 @@ test('复杂场景：多视野重叠带的整体最优', () => {
   assert.equal(r.linkCount, 3);
   assert.deepEqual(groupOf(r, 'C1'), ['A1', 'B1', 'C1']);
   assert.deepEqual(groupOf(r, 'A2'), ['A2', 'B2']);
+});
+
+test('规模内但搜索爆炸的稠密草稿：抛出规模错误（API 转为受控 422）', () => {
+  // 前两个视野各 20 个同类别同坐标观测 → 单分量 40 节点 / 400 条等权候选关联
+  // （低于 200 节点 / 5000 边的静态上限），第三个视野 1 个孤立观测；
+  // 精确裁决组合爆炸，必须在搜索预算内快速失败而不是长时间占用服务。
+  const dense = (prefix) => Array.from({ length: 20 }, (_, i) => ({ id: `${prefix}${i + 1}`, x: 10, y: 10, category: 'PE' }));
+  const input = mk(5, [
+    { particles: dense('A') },
+    { particles: dense('B') },
+    { offset: { x: 100000, y: 100000 }, particles: [{ id: 'C1', x: 0, y: 0, category: 'PP' }] },
+  ]);
+  assert.throws(() => solveDeduplication(input), (err) => {
+    assert.ok(err instanceof SolverLimitError);
+    assert.match(err.message, /搜索量超出可承受上限/);
+    return true;
+  });
+});
+
+test('搜索预算不妨碍常规合法草稿的精确裁决', () => {
+  // 与稠密草稿同规模上限内、但候选稀疏的常规草稿仍应得到精确结论。
+  const input = mk(3, [
+    { particles: [{ id: 'A1', x: 0, y: 0, category: 'PE' }, { id: 'A2', x: 50, y: 50, category: 'PP' }] },
+    { particles: [{ id: 'B1', x: 1, y: 0, category: 'PE' }, { id: 'B2', x: 52, y: 51, category: 'PP' }] },
+    { particles: [{ id: 'C1', x: 0, y: 2, category: 'PE' }] },
+  ]);
+  const r = solveDeduplication(input);
+  assert.equal(r.totalParticles, 2);
+  assert.equal(r.linkCount, 3);
+  assert.deepEqual(groupOf(r, 'C1'), ['A1', 'B1', 'C1']);
 });

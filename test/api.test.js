@@ -90,3 +90,50 @@ test('未知接口返回 404', async () => {
   const res = await fetch(`${base}/api/no-such-endpoint`);
   assert.equal(res.status, 404);
 });
+
+test('规模内但无法及时完成精确裁决的稠密草稿 → 受控 422，服务保持可响应', async () => {
+  // 41 个观测、400 条候选关联：低于单分量 200 节点 / 5000 边的静态上限，
+  // 但精确裁决组合爆炸；应快速返回明确的 422 业务规模错误。
+  const dense = (prefix) => Array.from({ length: 20 }, (_, i) => ({ id: `${prefix}${i + 1}`, x: 10, y: 10, category: 'PE' }));
+  const res = await post({
+    tolerance: 5,
+    fields: [
+      { offset: { x: 0, y: 0 }, particles: dense('A') },
+      { offset: { x: 0, y: 0 }, particles: dense('B') },
+      { offset: { x: 100000, y: 100000 }, particles: [{ id: 'C1', x: 0, y: 0, category: 'PP' }] },
+    ],
+  });
+  assert.equal(res.status, 422);
+  const body = await res.json();
+  assert.ok(body.error && typeof body.error.message === 'string' && body.error.message.length > 0);
+
+  // 服务保持可响应：健康检查正常
+  const health = await fetch(`${base}/api/health`);
+  assert.equal(health.status, 200);
+
+  // 既有合法草稿仍按原有去重语义完成裁决
+  const ok = await post({
+    tolerance: 1,
+    fields: [
+      { offset: { x: 0, y: 0 }, particles: [{ id: 'A1', x: 0, y: 0, category: 'PE' }, { id: 'A2', x: 2, y: 0, category: 'PE' }] },
+      { offset: { x: 0, y: 0 }, particles: [{ id: 'B1', x: 1, y: 0, category: 'PE' }, { id: 'B2', x: 0, y: 1, category: 'PE' }] },
+      { offset: { x: 100, y: 100 }, particles: [{ id: 'C1', x: 0, y: 0, category: 'PP' }] },
+    ],
+  });
+  assert.equal(ok.status, 200);
+  const okBody = await ok.json();
+  assert.equal(okBody.totalParticles, 3);
+  assert.equal(okBody.linkCount, 2);
+
+  // 真正无效的输入仍保持既有业务错误反馈（400 + 可定位 issues）
+  const bad = await post({
+    tolerance: 1,
+    fields: [
+      { offset: { x: 0, y: 0 }, particles: [{ id: 'A1', x: 0, y: 0, category: 'PE' }] },
+      { offset: { x: 0, y: 0 }, particles: [{ id: 'A1', x: 0.5, y: 0, category: '' }] },
+    ],
+  });
+  assert.equal(bad.status, 400);
+  const badBody = await bad.json();
+  assert.ok(Array.isArray(badBody.error.issues) && badBody.error.issues.length > 0);
+});
