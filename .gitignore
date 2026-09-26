@@ -1,0 +1,16 @@
+.DS_Store
+.env
+.venv/
+venv/
+node_modules/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.pnpm-store/
+*.py[cod]
+
+# 证据单本地数据目录（DATA_DIR 默认值）
+data/
